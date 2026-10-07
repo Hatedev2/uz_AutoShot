@@ -1,5 +1,25 @@
 # uz_AutoShot
 
+## Modified fork
+
+This is a modified fork of [uz-scripts/uz_AutoShot](https://github.com/uz-scripts/uz_AutoShot), originally developed by UZ. The original credits and [Apache 2.0 license](LICENSE) are preserved.
+
+### Changes in this fork
+
+- **Transparent-border crop tool:** `npm run crop:transparent` recursively crops PNGs from `shots/` into `shots-cropped/`, keeping the folder structure and leaving originals untouched. Existing output files are skipped, semi-transparent edges are preserved, and fully transparent images are reported and skipped.
+- **Streamed head replacement setup:** masks, hats, glasses, accessories, and undershirts select head component `0`, drawable `0`, texture `1` instead of using a head chroma sphere for these categories. Per-category `componentTextureOverrides` are applied in previews, batch captures, and re-captures.
+- **Isolated accessory and watch captures:** accessories no longer keep the torso component visible; watches no longer keep the torso/arm component visible. The wrist-raise animation remains enabled for watches.
+- **Upload back-pressure:** `Customize.MaxPendingUploads` defaults to `1`; server acknowledgements limit the number of pending uploads.
+- **Per-player studios:** routing buckets use `Customize.RoutingBucket + server ID` so concurrent captures do not share a studio; the previous bucket is saved for restoration.
+- **PNG processing changes:** optional browser-side resizing (`Customize.BrowserDownscale`) with a server-side fallback, a shared decoded PNG for image processing, and reduced-size chroma processing for large frames.
+- **Smaller default thumbnails:** the default capture size is now `256 x 256`.
+
+**Important:** the streamed head replacements affect freemode head assets globally while this resource is loaded. Use this setup on a development/capture server, not a live server where normal character heads must remain intact. See [Configuration](#configuration) for details.
+
+Captured images, cropped output, and installed dependencies are not included in the repository. The crop tool has been checked against captured PNGs and repeat-run output preservation; visual capture behavior still needs validation in FiveM.
+
+---
+
 **All-in-one screenshot studio for FiveM. Captures clothing, props, vehicles, world objects, and appearance overlays with transparent backgrounds.**
 
 Iterates every drawable and texture automatically, runs chroma key removal server-side, and serves the results in an in-game browser. No external tools needed.
@@ -44,7 +64,7 @@ Iterates every drawable and texture automatically, runs chroma key removal serve
 - **Pause and resume**: long capture sessions can be paused mid-batch (default Space) and resumed without losing progress.
 - **Quick capture commands**: `/shotcar <model>` and `/shotprop <model>` skip the UI for one-off captures.
 - **Cross-resource integration**: server exports return `cfx-nui` photo URLs that any other resource's NUI can render with `<img src="...">`. No HTTP, no port forwarding, no base64.
-- **Configurable head chroma mask**: stack multiple spheres on `SKEL_Head` to wipe the head out for accessory and torso shots without clipping the clothing.
+- **Head masking for clean captures**: masks, hats, glasses, accessories, and undershirts use streamed freemode head replacements; other categories can use configurable chroma-mask spheres on `SKEL_Head`.
 
 ---
 
@@ -87,6 +107,22 @@ Type `/shotmaker`, pick what you want to capture, frame the orbit camera, hit St
 | `/shotprop <model>` | Capture a single world object by model name. |
 
 Both `/shotmaker` and `/wardrobe` use the names from `Customize.Command` and `Customize.MenuCommand`, change them there if you want different command names.
+
+### Crop transparent image borders
+
+To crop fully transparent margins from captured PNGs without changing the originals, run this from the resource directory:
+
+```sh
+npm run crop:transparent
+```
+
+The script reads PNGs recursively from `shots/` and writes cropped copies to `shots-cropped/`, preserving the folder structure. Images whose output file already exists are skipped without overwriting it, so repeated runs process only new files. You can provide different input and output directories:
+
+```sh
+npm run crop:transparent -- "shots" "shots-cropped"
+```
+
+Fully transparent images are skipped. Only pixels with alpha greater than zero are kept when determining the crop bounds.
 
 ### ACE permissions
 
@@ -139,14 +175,18 @@ All settings live in [`Customize.lua`](Customize.lua). Common knobs:
 | `Customize.AceRestricted` | `false` | Require ACE permission for commands and capture events |
 | `Customize.ScreenshotFormat` | `'png'` | Output format: `'png'`, `'webp'`, or `'jpg'` |
 | `Customize.TransparentBg` | `true` | Chroma key removal (PNG only) |
-| `Customize.ScreenshotWidth` | `512` | Output image width |
-| `Customize.ScreenshotHeight` | `512` | Output image height |
+| `Customize.ScreenshotWidth` | `256` | Output image width |
+| `Customize.ScreenshotHeight` | `256` | Output image height |
+| `Customize.BrowserDownscale` | `true` | Crop and resize in `screenshot-basic` before upload to reduce processing and network load |
+| `Customize.MaxPendingUploads` | `1` | Number of captures allowed in server processing at once |
 | `Customize.CaptureAllTextures` | `false` | Capture all texture variants (not just default) |
 | `Customize.ChromaKeyColor` | `'magenta'` | Background color: `'green'` or `'magenta'` |
 | `Customize.BatchSize` | `10` | Captures per batch before cooldown |
 | `Customize.LatentRate` | `8000000` | Bytes/sec throttle for capture uploads |
 
-Camera presets, studio lighting, green screen dimensions, the head chroma mask (`Customize.HeadMask`), clothing/prop/overlay categories, and the object list are also configurable in the same file. Full reference at [uz-scripts.com/docs/free/uz-autoshot](https://uz-scripts.com/docs/free/uz-autoshot).
+Camera presets, studio lighting, green screen dimensions, the head chroma mask (`Customize.HeadMask`), clothing/prop/overlay categories, and the object list are also configurable in the same file. Hat and glasses captures require the two freemode head replacement files in `stream/`; they are included with the resource. Full reference at [uz-scripts.com/docs/free/uz-autoshot](https://uz-scripts.com/docs/free/uz-autoshot).
+
+**Development-only head replacements:** mask, hat, glasses, accessories, and undershirt categories use the Greenscreener head drawable at component `0`, drawable `0`, texture `1`. The streamed YDD files replace freemode head assets globally while loaded, not just inside the studio. Capture setup avoids head blending, as Greenscreener does. Restoring appearance values cannot restore the original head geometry; these assets are not suitable for a live server that must preserve normal character heads.
 
 ---
 
@@ -233,10 +273,10 @@ After a fresh capture, restart the resource before any other script can `<img sr
 | **Wardrobe and other UIs don't see brand-new captures.** | Restart the resource (`restart uz_AutoShot` or `refresh; ensure uz_AutoShot`). FiveM indexes the `cfx-nui` `files {}` block at resource start, so new PNGs only become servable after the next start. Existing photos keep working without restart. This is the single most common gotcha, do this first. |
 | Thumbnails come out fully black or blank. | `screenshot-basic` must start before `uz_AutoShot` in `server.cfg`. Watch the server console for `[uz_AutoShot] Saved: ...` lines while capturing. |
 | Magenta or green halo around the subject. | Switch `Customize.ChromaKeyColor`. Magenta tends to cut cleaner on skin tones, green is friendlier with red/orange clothing. |
-| Head clips into hats, hoods, or armor. | Tune `Customize.HeadMask`. Make the existing sphere smaller, or stack a second sphere for the neck. The commented neck entry in `Customize.lua` is a starting point. |
+| Head clips into masks, hats, or glasses. | Confirm both freemode head replacement files are present in `stream/`. Do not apply freemode head blending to the replacement mesh. For other categories, tune `Customize.HeadMask`; make the sphere smaller or stack a second sphere for the neck. |
 | Resource refuses to start, console shows a name error. | Folder must be named exactly `uz_AutoShot`, case-sensitive. |
 | Wardrobe is empty. | Run `/shotmaker` to generate photos first, then restart the resource (see the first row). |
-| Captures stall mid-batch. | Lower `ScreenshotWidth`/`ScreenshotHeight` to 256 to ease the per-frame cost, or raise `Customize.LatentRate` if upload throughput is the bottleneck. |
+| Captures stall mid-batch. | Keep `BrowserDownscale` enabled and `MaxPendingUploads` at `1` to reduce upload and server processing load. If your `screenshot-basic` does not support downscaling, it falls back to server-side resizing. |
 | Single capture failing for a model. | Spawn name typo. Use `/shotcar adder` or `/shotprop prop_bench_01a` with the exact model spawn name. |
 
 ---

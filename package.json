@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "description": "Clothing Thumbnail Generator & Browser for FiveM",
   "main": "server/server.js",
-  "scripts": {},
+  "scripts": {
+    "crop:transparent": "node crop-transparent.js"
+  },
   "dependencies": {
     "pngjs": "^7.0.0"
   }

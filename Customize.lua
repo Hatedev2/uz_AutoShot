@@ -1,16 +1,19 @@
+-- Modified fork: capture sizing, upload limits, and category head/body visibility.
 Customize = {}
 
 -- General
 Customize.Command           = 'shotmaker'
 Customize.MenuCommand       = 'wardrobe'
 Customize.AceRestricted     = false          -- true = ACE permission required (see README)
-Customize.RoutingBucket     = 999
+Customize.RoutingBucket     = 999            -- base id: each player gets their own bucket = base + server id
 
 Customize.ScreenshotQuality = 0.92          -- 0.0–1.0 (webp/jpg only)
 Customize.ScreenshotFormat  = 'png'         -- 'png' | 'webp' | 'jpg'
 Customize.TransparentBg     = true          -- chroma key removal (png only)
-Customize.ScreenshotWidth   = 512
-Customize.ScreenshotHeight  = 512
+Customize.ScreenshotWidth   = 256
+Customize.ScreenshotHeight  = 256
+Customize.BrowserDownscale  = true           -- crop + downscale inside screenshot-basic before encoding.
+                                            -- Falls back to server-side resize if unsupported.
 
 Customize.StudioCoords      = vector3(0.0, 0.0, -150.0)
 Customize.StudioHeading     = 180.0
@@ -24,7 +27,8 @@ Customize.CaptureAllTextures = false        -- true = all textures, false = text
 Customize.BatchSize         = 10
 Customize.BatchPauseWait    = 2000          -- ms
 Customize.GCInterval        = 20
-Customize.LatentRate        = 8000000       -- bytes/sec for capture upload (latent event throttle).
+Customize.MaxPendingUploads = 1              -- serialize uploads so server-side image processing cannot pile up.
+Customize.LatentRate        = 8000000      -- bytes/sec for capture upload (latent event throttle).
                                             -- 8 MB/s is plenty for 512x512; raise for 4K source frames
                                             -- (e.g. 16000000 = 16 MB/s) if uploads bottleneck the queue.
 
@@ -39,8 +43,7 @@ Customize.GreenScreen = {
 }
 
 -- Head Chroma Mask — covers the ped's head with chroma color so the server
--- can wipe it out for accessory/torso shots (configured per category via
--- the `hideHead = true` flag). Each entry is a sphere centered on SKEL_Head
+-- can wipe it out for categories with `hideHead = true`. Each entry is a sphere centered on SKEL_Head
 -- plus its own offsets, sized by sizeX/Y/Z, and optionally rotated by
 -- rotX/rotY/rotZ (degrees).
 --
@@ -95,17 +98,18 @@ Customize.CameraPresets = {
 -- Clothing Categories (componentId -> camera preset)
 -- visibleComponents : component IDs that remain visible at drawable 0 (e.g. 0=head, 2=hair, 3=torso)
 -- componentOverrides: override specific component drawables (e.g. {[3] = 15} sets torso to drawable 15)
+-- componentTextureOverrides: override textures on visible component drawables
 -- previewDrawable   : drawable shown in preview mode (default: 0)
 -- hideHead          : draw a chroma-key sphere over the head during capture (removed by bg removal)
 Customize.Categories = {
     { componentId = 2,  label = 'Hair',          camera = 'hair',        visibleComponents = {0}, previewDrawable = 15 },
-    { componentId = 1,  label = 'Mask',          camera = 'mask',        visibleComponents = {0, 2}, previewDrawable = 23 },
+    { componentId = 1,  label = 'Mask',          camera = 'mask',        visibleComponents = {0}, componentTextureOverrides = {[0] = 1}, previewDrawable = 23 },
     { componentId = 3,  label = 'Arms / Gloves', camera = 'arms_gloves', visibleComponents = {}, hideHead = true },
     { componentId = 4,  label = 'Pants',         camera = 'legs',        visibleComponents = {} },
     { componentId = 5,  label = 'Bags',          camera = 'decals',      visibleComponents = {}, previewDrawable = 1, hideHead = true },
     { componentId = 6,  label = 'Shoes',         camera = 'shoes',       visibleComponents = {}, previewDrawable = 1 },
-    { componentId = 7,  label = 'Accessories',   camera = 'accessories', visibleComponents = {0, 3}, componentOverrides = {[3] = 15}, hideHead = true },
-    { componentId = 8,  label = 'Undershirt',    camera = 'tops',        visibleComponents = {}, hideHead = true },
+    { componentId = 7,  label = 'Accessories',   camera = 'accessories', visibleComponents = {0}, componentTextureOverrides = {[0] = 1} },
+    { componentId = 8,  label = 'Undershirt',    camera = 'tops',        visibleComponents = {0}, componentTextureOverrides = {[0] = 1} },
     { componentId = 9,  label = 'Body Armor',    camera = 'body',        visibleComponents = {}, previewDrawable = 1, hideHead = true },
     { componentId = 10, label = 'Decals',        camera = 'decals',      visibleComponents = {3}, componentOverrides = {[3] = 15}, hideHead = true },
     { componentId = 11, label = 'Tops',          camera = 'tops',        visibleComponents = {}, hideHead = true },
@@ -114,10 +118,10 @@ Customize.Categories = {
 -- Prop Categories (propId -> camera preset)
 -- anim: optional animation played during capture (dict, name, flag)
 Customize.PropCategories = {
-    { propId = 0, label = 'Hats',      camera = 'hats',      visibleComponents = {0, 2} },
-    { propId = 1, label = 'Glasses',   camera = 'glasses',   visibleComponents = {0, 2}, previewDrawable = 2 },
+    { propId = 0, label = 'Hats',      camera = 'hats',      visibleComponents = {0}, componentTextureOverrides = {[0] = 1} },
+    { propId = 1, label = 'Glasses',   camera = 'glasses',   visibleComponents = {0}, componentTextureOverrides = {[0] = 1}, previewDrawable = 2 },
     { propId = 2, label = 'Ears',      camera = 'ears',      visibleComponents = {0, 2} },
-    { propId = 6, label = 'Watches',   camera = 'watches',   visibleComponents = {3}, anim = { dict = 'anim@heists@ornate_bank@grab_cash', name = 'grab', flag = 49 } },
+    { propId = 6, label = 'Watches',   camera = 'watches',   visibleComponents = {}, anim = { dict = 'anim@heists@ornate_bank@grab_cash', name = 'grab', flag = 49 } },
     { propId = 7, label = 'Bracelets', camera = 'bracelets', visibleComponents = {3}, anim = { dict = 'anim@heists@ornate_bank@grab_cash', name = 'grab', flag = 49 } },
 }
 

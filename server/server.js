@@ -1,3 +1,4 @@
+// Modified fork: PNG processing, upload acknowledgements, and per-player studio buckets.
 const path = require('path');
 const fs   = require('fs');
 const { PNG } = require('pngjs');
@@ -28,8 +29,11 @@ function checkAce(src) {
     return IsPlayerAceAllowed(src.toString(), ACE_NAME);
 }
 
-function removeChromaKey(pngBuffer, mode) {
-    const png = PNG.sync.read(pngBuffer);
+// Operates in place on an already-decoded PNG so the image is only decoded /
+// encoded once per capture (see the processCapture handler).
+// featherRadius: 2 for full-size frames; 1 when the frame was already
+// downscaled in the browser (same visual feather at ~half the pixel size).
+function removeChromaKey(png, mode, featherRadius) {
     const d = png.data;
     const w = png.width, h = png.height;
     let removed = 0;
@@ -76,7 +80,7 @@ function removeChromaKey(pngBuffer, mode) {
     }
 
     // Two-pass alpha feather: 5x5 box blur on alpha channel for smooth edges
-    const RADIUS = 2;
+    const RADIUS = featherRadius || 2;
     const KERNEL = (RADIUS * 2 + 1) * (RADIUS * 2 + 1);
     const totalPx = w * h;
     const src = new Uint8Array(totalPx);
@@ -106,12 +110,58 @@ function removeChromaKey(pngBuffer, mode) {
     }
 
     console.log('^2[uz_AutoShot]^0 Chroma key (' + mode + '): ' + removed + '/' + totalPx + ' pixels removed, edges feathered');
-    return PNG.sync.write(png, { colorType: 6 });
 }
 
-function resizePNG(pngBuffer, targetW, targetH) {
-    const src = PNG.sync.read(pngBuffer);
-    if (src.width === targetW && src.height === targetH) return pngBuffer;
+// Light sharpen on RGB after downscale (3x3 unsharp: center 5, neighbors -1)
+function sharpenRGB(png) {
+    const dd = png.data, targetW = png.width, targetH = png.height;
+    const STRENGTH = 0.3;
+    for (let y = 1; y < targetH - 1; y++) {
+        for (let x = 1; x < targetW - 1; x++) {
+            const ci = (y * targetW + x) << 2;
+            // Skip fully transparent pixels
+            if (dd[ci + 3] === 0) continue;
+            const t = (ci - (targetW << 2));     // top row
+            const b = (ci + (targetW << 2));     // bottom row
+            for (let c = 0; c < 3; c++) {
+                const sharp = 5 * dd[ci + c] - dd[t + c] - dd[b + c] - dd[ci - 4 + c] - dd[ci + 4 + c];
+                const blended = dd[ci + c] + (sharp - dd[ci + c]) * STRENGTH;
+                dd[ci + c] = blended < 0 ? 0 : blended > 255 ? 255 : (blended + 0.5) | 0;
+            }
+        }
+    }
+}
+
+// Center-crops to the target aspect ratio. Doing this BEFORE the chroma key
+// means the (per-pixel + blur) keying only runs on pixels that survive the
+// final crop — ~44% fewer for a 16:9 frame going to a square thumbnail.
+// Returns the same object when the aspect already matches.
+function cropToAspect(src, targetW, targetH) {
+    const srcAspect = src.width / src.height;
+    const dstAspect = targetW / targetH;
+
+    let cropX = 0, cropY = 0, cropW = src.width, cropH = src.height;
+    if (srcAspect > dstAspect) {
+        cropW = Math.round(src.height * dstAspect);
+        cropX = Math.round((src.width - cropW) / 2);
+    } else if (srcAspect < dstAspect) {
+        cropH = Math.round(src.width / dstAspect);
+        cropY = Math.round((src.height - cropH) / 2);
+    }
+    if (cropW === src.width && cropH === src.height) return src;
+
+    const dst = new PNG({ width: cropW, height: cropH });
+    const rowBytes = cropW << 2;
+    for (let y = 0; y < cropH; y++) {
+        const si = ((cropY + y) * src.width + cropX) << 2;
+        src.data.copy(dst.data, y * rowBytes, si, si + rowBytes);
+    }
+    return dst;
+}
+
+// Takes a decoded PNG, returns the same object when no resize is needed.
+function resizePNG(src, targetW, targetH, skipSharpen) {
+    if (src.width === targetW && src.height === targetH) return src;
 
     // Center-crop to target aspect ratio first, then resize
     const srcAspect = src.width / src.height;
@@ -215,33 +265,35 @@ function resizePNG(pngBuffer, targetW, targetH) {
         }
     }
 
-    // Light sharpen on RGB after downscale (3x3 unsharp: center 5, neighbors -1)
-    if (isDownscale) {
-        const STRENGTH = 0.3;
-        for (let y = 1; y < targetH - 1; y++) {
-            for (let x = 1; x < targetW - 1; x++) {
-                const ci = (y * targetW + x) << 2;
-                // Skip fully transparent pixels
-                if (dd[ci + 3] === 0) continue;
-                const t = (ci - (targetW << 2));     // top row
-                const b = (ci + (targetW << 2));     // bottom row
-                for (let c = 0; c < 3; c++) {
-                    const sharp = 5 * dd[ci + c] - dd[t + c] - dd[b + c] - dd[ci - 4 + c] - dd[ci + 4 + c];
-                    const blended = dd[ci + c] + (sharp - dd[ci + c]) * STRENGTH;
-                    dd[ci + c] = blended < 0 ? 0 : blended > 255 ? 255 : (blended + 0.5) | 0;
-                }
-            }
-        }
-    }
+    if (isDownscale && !skipSharpen) sharpenRGB(dst);
 
-    console.log('^2[uz_AutoShot]^0 Crop+Resize: ' + src.width + 'x' + src.height + ' -> ' + cropW + 'x' + cropH + ' -> ' + targetW + 'x' + targetH + (isDownscale ? ' (area avg + sharpen)' : ' (bilinear)'));
-    return PNG.sync.write(dst, { colorType: 6 });
+    console.log('^2[uz_AutoShot]^0 Crop+Resize: ' + src.width + 'x' + src.height + ' -> ' + cropW + 'x' + cropH + ' -> ' + targetW + 'x' + targetH + (isDownscale ? (skipSharpen ? ' (area avg)' : ' (area avg + sharpen)') : ' (bilinear)'));
+    return dst;
 }
 
 const MAX_PAYLOAD_BYTES = 20 * 1024 * 1024;
 
+// The client throttles itself on these acks (Customize.MaxPendingUploads) so
+// captures can't pile up faster than the server can process them.
 onNet('uz_autoshot:server:processCapture', (payload) => {
     const src = source;
+    const seq = payload && typeof payload === 'object' ? payload.seq : undefined;
+    handleCapture(src, payload)
+        .catch((err) => console.log('^1[uz_AutoShot]^0 Process error: ' + (err && err.message ? err.message : err)))
+        .finally(() => {
+            if (seq !== undefined) TriggerClientEvent('uz_autoshot:client:captureProcessed', src, seq);
+        });
+});
+
+// Lets the rest of the server (player sync, other resources) run between the
+// heavy pixel stages instead of freezing the event loop for the whole capture.
+const yieldLoop = () => new Promise((resolve) => setImmediate(resolve));
+
+// Output PNGs are small (thumbnails), so cheaper deflate + a single filter
+// costs a few KB at most and skips pngjs' default "try all 5 filters, level 9".
+const PNG_WRITE_OPTS = { colorType: 6, deflateLevel: 6, filterType: 4 };
+
+async function handleCapture(src, payload) {
     if (!checkAce(src)) {
         console.log('^1[uz_AutoShot]^0 Refused capture: player ' + src + ' lacks ' + ACE_NAME);
         return;
@@ -278,27 +330,70 @@ onNet('uz_autoshot:server:processCapture', (payload) => {
 
         let ext = wantFormat;
 
+        // Decode once, run every step on the pixel data, encode once. Previously
+        // each step re-decoded and re-encoded the full-resolution frame.
+        let png = null;
+        let dirty = false;
+
+        const wantResize = wantWidth > 0 && wantHeight > 0;
+        const MAX_DIM = 4096;
+        const clampedW = Math.min(Math.max(wantWidth, 16), MAX_DIM);
+        const clampedH = Math.min(Math.max(wantHeight, 16), MAX_DIM);
+        // The screenshot comes straight from the game canvas, so CRC checking is wasted work.
+        // Async parse inflates on libuv's threadpool instead of blocking the server thread.
+        const readPng = () => new Promise((resolve, reject) => {
+            new PNG({ checkCRC: false }).parse(outputData, (err, parsed) => err ? reject(err) : resolve(parsed));
+        });
+
         if (wantTransp) {
             try {
-                outputData = removeChromaKey(outputData, chromaKey);
+                png = await readPng();
+                await yieldLoop();
+                // Already downscaled by screenshot-basic (BrowserDownscale)? Then skip
+                // crop/resize entirely and just key + sharpen at the final size.
+                const preScaled = payload.preScaled === true && wantResize
+                    && png.width === clampedW && png.height === clampedH;
+                let featherRadius = preScaled ? 1 : 2;
+                if (wantResize && !preScaled) {
+                    png = cropToAspect(png, clampedW, clampedH);
+                    // Key at 2x the output size instead of full resolution: a 1600x1600
+                    // frame is ~10x more pixels than 512x512 and stalled the server thread.
+                    const keyW = clampedW * 2, keyH = clampedH * 2;
+                    if (png.width > keyW && png.height > keyH) {
+                        await yieldLoop();
+                        png = resizePNG(png, keyW, keyH, true);
+                        featherRadius = 1;
+                    }
+                    await yieldLoop();
+                }
+                removeChromaKey(png, chromaKey, featherRadius);
+                if (preScaled) sharpenRGB(png);
                 ext = 'png';
+                dirty = true;
             } catch (e) {
+                png = null;
                 console.log('^3[uz_AutoShot]^0 Chroma key skipped: ' + e.message);
             }
         }
 
-        if (wantWidth > 0 && wantHeight > 0 && ext === 'png') {
-            const MAX_DIM = 4096;
-            const clampedW = Math.min(Math.max(wantWidth, 16), MAX_DIM);
-            const clampedH = Math.min(Math.max(wantHeight, 16), MAX_DIM);
+        if (wantResize && ext === 'png') {
             try {
-                outputData = resizePNG(outputData, clampedW, clampedH);
+                await yieldLoop();
+                if (!png) png = await readPng();
+                const resized = resizePNG(png, clampedW, clampedH);
+                if (resized !== png) { png = resized; dirty = true; }
             } catch (e) {
                 console.log('^3[uz_AutoShot]^0 Resize skipped: ' + e.message);
             }
-        } else if (wantWidth > 0 && wantHeight > 0 && ext !== 'png') {
+        } else if (wantResize && ext !== 'png') {
             console.log('^3[uz_AutoShot]^0 Resize requires PNG format; skipping for ' + ext);
         }
+
+        if (png && dirty) {
+            await yieldLoop();
+            outputData = PNG.sync.write(png, PNG_WRITE_OPTS);
+        }
+        png = null;
 
         const outputPath = path.resolve(path.join(OUTPUT_DIR, xFilename + '.' + ext));
         if (!outputPath.startsWith(OUTPUT_DIR + path.sep)) {
@@ -306,9 +401,8 @@ onNet('uz_autoshot:server:processCapture', (payload) => {
             return;
         }
 
-        const dir = path.dirname(outputPath);
-        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-        fs.writeFileSync(outputPath, outputData);
+        await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
+        await fs.promises.writeFile(outputPath, outputData);
 
         const sizeKB = Math.round(outputData.length / 1024);
         const label = wantTransp ? 'bg removed' : ext;
@@ -316,15 +410,34 @@ onNet('uz_autoshot:server:processCapture', (payload) => {
     } catch (err) {
         console.log('^1[uz_AutoShot]^0 Process error: ' + (err && err.message ? err.message : err));
     }
-});
+}
 
-onNet('uz_autoshot:server:setBucket', (bucket) => {
+// Each player gets a private studio instance (BUCKET_BASE + server id), so
+// several people can run captures at the same time without seeing each other.
+// The bucket id is computed here, never taken from the client.
+const BUCKET_BASE = parseInt(GetConvar('uz_autoshot_bucket_base', '999')) || 999;
+const savedBuckets = new Map(); // src -> bucket the player was in before entering the studio
+
+function restoreBucket(src) {
+    if (!savedBuckets.has(src)) return;
+    const previous = savedBuckets.get(src);
+    savedBuckets.delete(src);
+    SetPlayerRoutingBucket(src.toString(), previous);
+    console.log('^2[uz_AutoShot]^0 Player ' + src + ' -> bucket ' + previous);
+}
+
+onNet('uz_autoshot:server:setBucket', () => {
     const src = source;
     if (!checkAce(src)) {
         console.log('^1[uz_AutoShot]^0 Refused setBucket: player ' + src + ' lacks ' + ACE_NAME);
         return;
     }
+    const bucket = BUCKET_BASE + parseInt(src);
+    // setBucket can be called several times per session: only remember the
+    // original bucket the first time, otherwise we'd "restore" into the studio.
+    if (!savedBuckets.has(src)) savedBuckets.set(src, GetPlayerRoutingBucket(src.toString()));
     SetPlayerRoutingBucket(src.toString(), bucket);
+    SetRoutingBucketPopulationEnabled(bucket, false);
     console.log('^2[uz_AutoShot]^0 Player ' + src + ' -> bucket ' + bucket);
 });
 
@@ -334,7 +447,13 @@ onNet('uz_autoshot:server:resetBucket', () => {
         console.log('^1[uz_AutoShot]^0 Refused resetBucket: player ' + src + ' lacks ' + ACE_NAME);
         return;
     }
-    SetPlayerRoutingBucket(src.toString(), 0);
-    console.log('^2[uz_AutoShot]^0 Player ' + src + ' -> bucket 0');
+    if (savedBuckets.has(src)) restoreBucket(src);
+    else {
+        SetPlayerRoutingBucket(src.toString(), 0);
+        console.log('^2[uz_AutoShot]^0 Player ' + src + ' -> bucket 0');
+    }
 });
 
+on('playerDropped', () => {
+    savedBuckets.delete(source);
+});

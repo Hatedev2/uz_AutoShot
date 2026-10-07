@@ -1,5 +1,7 @@
 /node_modules
 /shots
+/shots-cropped
+/resources/node_modules
 .yarn*
 yarn*
 

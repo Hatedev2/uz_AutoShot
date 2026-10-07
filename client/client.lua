@@ -1,3 +1,4 @@
+-- Modified fork: upload back-pressure, browser downscale, and head texture overrides.
 local isCapturing       = false
 local isBrowsing        = false
 local isPaused          = false
@@ -434,7 +435,33 @@ end
 -- CAPTURE & UPLOAD
 -- ════════════════════════════════════════════════════════
 
+-- Back-pressure on uploads. Without it the client fires captures faster than
+-- the server can decode/chroma-key/resize them, the latent-event queue and the
+-- screenshot buffers pile up, and FPS decays over a long run.
+local uploadSeq     = 0
+local pendingUpload = {}   -- [seq] = true until the server acks it
+local pendingCount  = 0
+
+RegisterNetEvent('uz_autoshot:client:captureProcessed', function(seq)
+    if pendingUpload[seq] then
+        pendingUpload[seq] = nil
+        pendingCount = pendingCount - 1
+    end
+end)
+
+local function WaitForUploadSlot(maxPending)
+    local deadline = GetGameTimer() + 60000
+    while pendingCount >= maxPending and not isCancelled and GetGameTimer() < deadline do
+        Wait(50)
+    end
+    if pendingCount >= maxPending and not isCancelled then
+        -- Server never acked (crashed / restarted): drop the backlog instead of stalling forever.
+        pendingUpload, pendingCount = {}, 0
+    end
+end
+
 local function CaptureAndUpload(filename)
+    WaitForUploadSlot(Customize.MaxPendingUploads or 2)
     ForceHighQuality()
 
     local encoding = Customize.ScreenshotFormat or 'png'
@@ -443,6 +470,15 @@ local function CaptureAndUpload(filename)
     local opts = { encoding = encoding }
     if encoding ~= 'png' then
         opts.quality = Customize.ScreenshotQuality
+    end
+
+    -- Only PNG is resized server-side, so only ask the browser to downscale then.
+    local preScaled = false
+    if Customize.BrowserDownscale and encoding == 'png'
+        and (Customize.ScreenshotWidth or 0) > 0 and (Customize.ScreenshotHeight or 0) > 0 then
+        opts.outputWidth  = Customize.ScreenshotWidth
+        opts.outputHeight = Customize.ScreenshotHeight
+        preScaled = true
     end
 
     local done, base64 = false, nil
@@ -459,13 +495,19 @@ local function CaptureAndUpload(filename)
         return
     end
 
+    uploadSeq = uploadSeq + 1
+    pendingUpload[uploadSeq] = true
+    pendingCount = pendingCount + 1
+
     TriggerLatentServerEvent('uz_autoshot:server:processCapture', Customize.LatentRate or 8000000, {
+        seq         = uploadSeq,
         filename    = filename,
         format      = Customize.ScreenshotFormat or 'png',
         transparent = Customize.TransparentBg and true or false,
         chromaKey   = Customize.ChromaKeyColor or 'green',
         width       = Customize.ScreenshotWidth or 0,
         height      = Customize.ScreenshotHeight or 0,
+        preScaled   = preScaled,
         imageData   = base64,
     })
 end
@@ -617,7 +659,8 @@ local function SetupCapturePed(modelHash)
     Wait(150)
 
     local ped = PlayerPedId()
-    SetPedHeadBlendData(ped, 0, 0, 0, 0, 0, 0, 0.0, 0.0, 0.0, false)
+    -- The streamed Greenscreener head is not compatible with freemode face blending.
+    SetPedDefaultComponentVariation(ped)
     SetEntityCoordsNoOffset(ped, Customize.StudioCoords.x, Customize.StudioCoords.y, Customize.StudioCoords.z, false, false, false)
     SetEntityHeading(ped, Customize.StudioHeading)
     FreezeEntityPosition(ped, true)
@@ -626,7 +669,7 @@ local function SetupCapturePed(modelHash)
     return ped
 end
 
-local function ResetPedForCategory(ped, visibleComponents, componentOverrides)
+local function ResetPedForCategory(ped, visibleComponents, componentOverrides, componentTextureOverrides)
     SetPedDefaultComponentVariation(ped)
     Wait(150)
 
@@ -641,12 +684,13 @@ local function ResetPedForCategory(ped, visibleComponents, componentOverrides)
     end
 
     local overrides = componentOverrides or {}
+    local textureOverrides = componentTextureOverrides or {}
 
     for i = 0, 11 do
         if overrides[i] then
-            SetPedComponentVariation(ped, i, overrides[i], 0, 0)
+            SetPedComponentVariation(ped, i, overrides[i], textureOverrides[i] or 0, 0)
         elseif visSet[i] then
-            SetPedComponentVariation(ped, i, 0, 0, 0)
+            SetPedComponentVariation(ped, i, 0, textureOverrides[i] or 0, 0)
         else
             SetPedComponentVariation(ped, i, -1, 0, 0)
         end
@@ -799,7 +843,7 @@ local function CaptureComponents(ped, gender, selectedSet)
         if isCancelled then return end
         if selectedSet and not selectedSet[cat.componentId] then goto nextComp end
 
-        ResetPedForCategory(ped, cat.visibleComponents, cat.componentOverrides)
+        ResetPedForCategory(ped, cat.visibleComponents, cat.componentOverrides, cat.componentTextureOverrides)
         hideHeadActive = cat.hideHead or false
         local preset, hasSaved = SetupCategoryCamera(ped, cat.camera)
 
@@ -850,7 +894,7 @@ local function CaptureProps(ped, gender, selectedSet)
         if isCancelled then return end
         if selectedSet and not selectedSet[cat.propId] then goto nextProp end
 
-        ResetPedForCategory(ped, cat.visibleComponents, cat.componentOverrides)
+        ResetPedForCategory(ped, cat.visibleComponents, cat.componentOverrides, cat.componentTextureOverrides)
         hideHeadActive = cat.hideHead or false
         local preset, hasSaved = SetupCategoryCamera(ped, cat.camera)
         PlayCategoryAnim(ped, cat.anim)
@@ -915,7 +959,7 @@ local function CaptureOverlays(ped, gender, selectedSet)
         if isCancelled then return end
         if selectedSet and not selectedSet[cat.overlayIndex] then goto nextOverlay end
 
-        ResetPedForCategory(ped, cat.visibleComponents, cat.componentOverrides)
+        ResetPedForCategory(ped, cat.visibleComponents, cat.componentOverrides, cat.componentTextureOverrides)
         hideHeadActive = false
 
         -- Clear all overlays first so only the target overlay is visible
@@ -1062,12 +1106,13 @@ end
 -- ════════════════════════════════════════════════════════
 
 local function RecaptureSpecificItems(items)
-    local cameraMap, visibilityMap, animMap, overridesMap, hideHeadMap = {}, {}, {}, {}, {}
+    local cameraMap, visibilityMap, animMap, overridesMap, textureOverridesMap, hideHeadMap = {}, {}, {}, {}, {}, {}
     for _, cat in ipairs(Customize.Categories) do
         local key = 'component_' .. cat.componentId
         cameraMap[key]     = cat.camera
         visibilityMap[key] = cat.visibleComponents
         overridesMap[key]  = cat.componentOverrides
+        textureOverridesMap[key] = cat.componentTextureOverrides
         hideHeadMap[key]   = cat.hideHead or false
     end
     for _, cat in ipairs(Customize.PropCategories) do
@@ -1075,6 +1120,7 @@ local function RecaptureSpecificItems(items)
         cameraMap[key]     = cat.camera
         visibilityMap[key] = cat.visibleComponents
         overridesMap[key]  = cat.componentOverrides
+        textureOverridesMap[key] = cat.componentTextureOverrides
         hideHeadMap[key]   = cat.hideHead or false
         animMap[key]       = cat.anim
     end
@@ -1115,7 +1161,7 @@ local function RecaptureSpecificItems(items)
         local visParts    = visibilityMap[itemKey]
         local animConfig  = animMap[itemKey]
 
-        ResetPedForCategory(ped, visParts, overridesMap[itemKey])
+        ResetPedForCategory(ped, visParts, overridesMap[itemKey], textureOverridesMap[itemKey])
         hideHeadActive = hideHeadMap[itemKey] or false
 
         local cameraKey = cameraMap[itemKey] or 'torso'
@@ -1651,6 +1697,7 @@ RegisterNUICallback('setCameraPreset', function(data, cb)
             local visComps = {}
             local previewDraw = 0
             local compOverrides = nil
+            local compTextureOverrides = nil
             local shouldHideHead = false
 
             if data.categoryType == 'component' then
@@ -1659,6 +1706,7 @@ RegisterNUICallback('setCameraPreset', function(data, cb)
                         visComps = cat.visibleComponents or {}
                         previewDraw = cat.previewDrawable or 0
                         compOverrides = cat.componentOverrides
+                        compTextureOverrides = cat.componentTextureOverrides
                         shouldHideHead = cat.hideHead or false
                         break
                     end
@@ -1668,6 +1716,7 @@ RegisterNUICallback('setCameraPreset', function(data, cb)
                     if cat.overlayIndex == data.categoryId then
                         visComps = cat.visibleComponents or {}
                         compOverrides = cat.componentOverrides
+                        compTextureOverrides = cat.componentTextureOverrides
                         break
                     end
                 end
@@ -1677,6 +1726,7 @@ RegisterNUICallback('setCameraPreset', function(data, cb)
                         visComps = cat.visibleComponents or {}
                         previewDraw = cat.previewDrawable or 0
                         compOverrides = cat.componentOverrides
+                        compTextureOverrides = cat.componentTextureOverrides
                         shouldHideHead = cat.hideHead or false
                         break
                     end
@@ -1684,7 +1734,7 @@ RegisterNUICallback('setCameraPreset', function(data, cb)
             end
 
             hideHeadActive = shouldHideHead
-            ResetPedForCategory(ped, visComps, compOverrides)
+            ResetPedForCategory(ped, visComps, compOverrides, compTextureOverrides)
             -- Always clear overlays when switching categories
             for i = 0, 12 do SetPedHeadOverlay(ped, i, 255, 1.0) end
 
